@@ -2,6 +2,8 @@ import "dotenv/config";
 import express from "express";
 import axios from "axios";
 import cors from "cors";
+import fs from "fs";
+import path from "path";
 
 const app = express();
 const COMPANIES = ["Apple", "OpenAI Anthropic Claude", "Microsoft", "Google", "Meta"];
@@ -11,9 +13,31 @@ const MODELS = [
   "poolside/laguna-xs-2.1:free",
   "google/gemma-4-31b-it:free",
 ];
+const OUTPUT_FILE = path.resolve(process.cwd(), "output.json");
 
 // Cache em memória
 let cachedNews: any = null;
+
+// Carrega o cache inicial do disco, se existir
+if (fs.existsSync(OUTPUT_FILE)) {
+  try {
+    const data = fs.readFileSync(OUTPUT_FILE, "utf-8");
+    cachedNews = JSON.parse(data);
+    console.log("💾 Cache inicial de notícias carregado a partir do output.json");
+  } catch (err: any) {
+    console.warn("⚠️ Não foi possível carregar output.json ao iniciar:", err?.message || err);
+    cachedNews = null;
+  }
+}
+
+function salvarCacheEmDisco(data: any) {
+  try {
+    fs.writeFileSync(OUTPUT_FILE, JSON.stringify(data, null, 2), "utf-8");
+    console.log("💾 Cache de notícias salvo com sucesso em output.json");
+  } catch (err: any) {
+    console.error("⚠️ Erro ao salvar output.json em disco:", err?.message || err);
+  }
+}
 
 // CORS liberado para qualquer porta de localhost / 127.0.0.1 (ex: 3001, 5173, etc.)
 app.use(
@@ -29,10 +53,8 @@ app.use(
 );
 
 function extrairJson(texto: string) {
-  // Limpa blocos de código ```json ... ```
   let limpo = texto.replace(/```json/gi, "").replace(/```/g, "").trim();
   
-  // Tenta achar o bloco JSON entre chaves { ... }
   const primeiroBracket = limpo.indexOf("{");
   const ultimoBracket = limpo.lastIndexOf("}");
   
@@ -46,7 +68,6 @@ function extrairJson(texto: string) {
 async function buscarNoticias() {
   console.log("🔍 Buscando notícias na Tavily em paralelo...");
 
-  // 1. Busca notícias de todas as empresas ao mesmo tempo
   const searchPromises = COMPANIES.map(async (company) => {
     try {
       const { data } = await axios.post("https://api.tavily.com/search", {
@@ -77,9 +98,17 @@ async function buscarNoticias() {
     .map((r) => `Empresa: ${r.empresa}\nTítulo: ${r.title}\nConteúdo: ${r.content}\nLink: ${r.url}`)
     .join("\n\n---\n\n");
 
-  const prompt = `Com base nessas notícias, gere um JSON com no máximo 5 notícias (uma por empresa).
+  const prompt = `Com base nessas notícias, gere um JSON com até 10 notícias (até duas por empresa).
+
+IMPORTANTE: TANTO o "title" quanto o "summary" DEVEM ser SEMPRE em português do Brasil (pt-BR), mesmo que a notícia original esteja em inglês. NUNCA deixe o título em inglês. O summary deve ser um resumo em 4-5 linhas, trazendo contexto, o que aconteceu, e por que é relevante.
+
 Responda APENAS com JSON válido, neste formato:
-{ "news": [ { "title": "", "summary": "resumo em 2 linhas em pt-BR", "source": "", "url": "", "company": "" } ] }
+{
+  "updatedAt": "data e hora em ISO string",
+  "news": [
+    { "title": "título em pt-BR", "summary": "resumo em 4-5 linhas em pt-BR, com contexto e relevância", "source": "fonte", "url": "link", "company": "empresa" }
+  ]
+}
 
 Notícias:
 ${context}`;
@@ -107,7 +136,10 @@ ${context}`;
       const parsed = extrairJson(content);
       if (parsed && parsed.news) {
         console.log(`🎉 Notícias formatadas com sucesso pelo modelo ${model}`);
-        return parsed;
+        return {
+          updatedAt: new Date().toISOString(),
+          news: parsed.news,
+        };
       }
     } catch (err: any) {
       console.warn(`⚠️ Modelo ${model} falhou (${err?.response?.status || err?.message}). Tentando próximo...`);
@@ -117,7 +149,8 @@ ${context}`;
   // 4. Fallback de emergência (caso todos os modelos gratuitos estejam temporariamente ocupados)
   console.log("⚠️ Usando fallback direto dos dados brutos da Tavily...");
   return {
-    news: rawResults.slice(0, 5).map((r) => ({
+    updatedAt: new Date().toISOString(),
+    news: rawResults.slice(0, 10).map((r) => ({
       title: r.title,
       summary: r.content ? r.content.slice(0, 200) + "..." : "Sem resumo disponível",
       source: r.url ? new URL(r.url).hostname : "Web",
@@ -132,6 +165,7 @@ app.get("/news/refresh", async (req, res) => {
   try {
     console.log("🔄 Forçando atualização de notícias (/news/refresh)...");
     cachedNews = await buscarNoticias();
+    salvarCacheEmDisco(cachedNews);
     res.json(cachedNews);
   } catch (error: any) {
     console.error("Erro na rota /news/refresh:", error?.message || error);
@@ -152,6 +186,7 @@ app.get("/news", async (req, res) => {
 
     console.log("🔄 Cache vazio. Buscando notícias pela primeira vez...");
     cachedNews = await buscarNoticias();
+    salvarCacheEmDisco(cachedNews);
     res.json(cachedNews);
   } catch (error: any) {
     console.error("Erro na rota /news:", error?.message || error);
